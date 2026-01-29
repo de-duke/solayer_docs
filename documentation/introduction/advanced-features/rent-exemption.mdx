@@ -1,0 +1,275 @@
+---
+title: "Rent Exemption Compatibility"
+---
+
+InfiniSVM uses **1% of Solana's rent** for account storage, making it **99% cheaper** to create accounts. However, this difference requires developers to use the correct instructions to avoid overpaying rent when creating tokens and accounts.
+
+## Why This Matters
+
+Solana programs can fetch rent in two ways:
+
+| Method | Behavior | Result on InfiniSVM |
+|--------|----------|---------------------|
+| `Rent::get()` syscall | Fetches rent from runtime | **Correct** - uses InfiniSVM's 1% rent |
+| `Rent::default()` | Uses hardcoded Solana values | **Wrong** - charges 100x too much |
+
+Instructions that rely on the **Rent sysvar account** internally use `Rent::from_account_info()`, which behaves like `Rent::default()` and returns Solana's hardcoded rent values. This causes **100x overpayment** on InfiniSVM.
+
+## Token Program Instructions
+
+The original Token Program includes both legacy instructions (which use the Rent sysvar) and newer variants (which use the `Rent::get()` syscall).
+
+### Instructions to Avoid
+
+| Instruction | Issue |
+|-------------|-------|
+| `InitializeMint` | Requires Rent sysvar, uses hardcoded rent |
+| `InitializeAccount` | Requires Rent sysvar, uses hardcoded rent |
+| `InitializeMultisig` | Requires Rent sysvar, uses hardcoded rent |
+
+### Recommended Instructions
+
+| Instruction | Benefit |
+|-------------|---------|
+| `InitializeMint2` | Uses `Rent::get()` syscall, correct rent calculation |
+| `InitializeAccount2` | Uses `Rent::get()` syscall, correct rent calculation |
+| `InitializeAccount3` | Uses `Rent::get()` syscall, most efficient variant |
+| `InitializeMultisig2` | Uses `Rent::get()` syscall, correct rent calculation |
+
+## Token 2022 Instructions
+
+Token 2022 (Token Extensions) follows the same pattern. Always use the "V2" or "V3" variants.
+
+### Instructions to Avoid
+
+| Instruction | Issue |
+|-------------|-------|
+| `InitializeMint` | Requires Rent sysvar |
+| `InitializeAccount` | Requires Rent sysvar |
+| `InitializeMultisig` | Requires Rent sysvar |
+
+### Recommended Instructions
+
+| Instruction | Benefit |
+|-------------|---------|
+| `InitializeMint2` | Uses `Rent::get()` syscall |
+| `InitializeAccount2` | Uses `Rent::get()` syscall |
+| `InitializeAccount3` | Uses `Rent::get()` syscall, most efficient |
+| `InitializeMultisig2` | Uses `Rent::get()` syscall |
+
+**Important for Token 2022:** Account sizes vary based on enabled extensions. Always calculate sizes dynamically rather than hardcoding values.
+
+## Code Examples
+
+### Creating a Mint with InitializeMint2 (TypeScript)
+
+```typescript
+import {
+  Connection,
+  Keypair,
+  SystemProgram,
+  Transaction,
+} from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  MINT_SIZE,
+  createInitializeMint2Instruction,
+} from "@solana/spl-token";
+
+async function createMint(
+  connection: Connection,
+  payer: Keypair,
+  mintAuthority: PublicKey,
+  decimals: number
+): Promise<PublicKey> {
+  const mint = Keypair.generate();
+
+  // Query rent from the chain - gets InfiniSVM's correct rent
+  const lamports = await connection.getMinimumBalanceForRentExemption(MINT_SIZE);
+
+  const transaction = new Transaction().add(
+    SystemProgram.createAccount({
+      fromPubkey: payer.publicKey,
+      newAccountPubkey: mint.publicKey,
+      space: MINT_SIZE,
+      lamports, // Correct rent from chain
+      programId: TOKEN_PROGRAM_ID,
+    }),
+    // Use InitializeMint2, NOT InitializeMint
+    createInitializeMint2Instruction(
+      mint.publicKey,
+      decimals,
+      mintAuthority,
+      null, // freeze authority
+      TOKEN_PROGRAM_ID
+    )
+  );
+
+  await sendAndConfirmTransaction(connection, transaction, [payer, mint]);
+  return mint.publicKey;
+}
+```
+
+### Creating a Token Account with InitializeAccount3 (TypeScript)
+
+```typescript
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+} from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  ACCOUNT_SIZE,
+  createInitializeAccount3Instruction,
+} from "@solana/spl-token";
+
+async function createTokenAccount(
+  connection: Connection,
+  payer: Keypair,
+  mint: PublicKey,
+  owner: PublicKey
+): Promise<PublicKey> {
+  const account = Keypair.generate();
+
+  // Query rent from the chain
+  const lamports = await connection.getMinimumBalanceForRentExemption(ACCOUNT_SIZE);
+
+  const transaction = new Transaction().add(
+    SystemProgram.createAccount({
+      fromPubkey: payer.publicKey,
+      newAccountPubkey: account.publicKey,
+      space: ACCOUNT_SIZE,
+      lamports,
+      programId: TOKEN_PROGRAM_ID,
+    }),
+    // Use InitializeAccount3 for best efficiency
+    createInitializeAccount3Instruction(
+      account.publicKey,
+      mint,
+      owner,
+      TOKEN_PROGRAM_ID
+    )
+  );
+
+  await sendAndConfirmTransaction(connection, transaction, [payer, account]);
+  return account.publicKey;
+}
+```
+
+### Token 2022 with Extensions (TypeScript)
+
+```typescript
+import {
+  Connection,
+  Keypair,
+  SystemProgram,
+  Transaction,
+} from "@solana/web3.js";
+import {
+  TOKEN_2022_PROGRAM_ID,
+  ExtensionType,
+  getMintLen,
+  createInitializeMint2Instruction,
+  createInitializeTransferFeeConfigInstruction,
+} from "@solana/spl-token";
+
+async function createMintWithTransferFee(
+  connection: Connection,
+  payer: Keypair,
+  mintAuthority: PublicKey,
+  decimals: number,
+  feeBasisPoints: number,
+  maxFee: bigint
+): Promise<PublicKey> {
+  const mint = Keypair.generate();
+
+  // Calculate size dynamically based on extensions
+  const extensions = [ExtensionType.TransferFeeConfig];
+  const mintLen = getMintLen(extensions);
+
+  // Query rent for the dynamic size
+  const lamports = await connection.getMinimumBalanceForRentExemption(mintLen);
+
+  const transaction = new Transaction().add(
+    SystemProgram.createAccount({
+      fromPubkey: payer.publicKey,
+      newAccountPubkey: mint.publicKey,
+      space: mintLen, // Dynamic size
+      lamports,       // Correct rent from chain
+      programId: TOKEN_2022_PROGRAM_ID,
+    }),
+    // Initialize extension BEFORE mint
+    createInitializeTransferFeeConfigInstruction(
+      mint.publicKey,
+      mintAuthority,
+      mintAuthority,
+      feeBasisPoints,
+      maxFee,
+      TOKEN_2022_PROGRAM_ID
+    ),
+    // Use InitializeMint2
+    createInitializeMint2Instruction(
+      mint.publicKey,
+      decimals,
+      mintAuthority,
+      null,
+      TOKEN_2022_PROGRAM_ID
+    )
+  );
+
+  await sendAndConfirmTransaction(connection, transaction, [payer, mint]);
+  return mint.publicKey;
+}
+```
+
+### Rust: Correct vs Incorrect Rent Usage
+
+When writing custom Solana programs, always use `Rent::get()` instead of `Rent::default()`.
+
+```rust
+use solana_program::rent::Rent;
+use solana_program::sysvar::Sysvar;
+
+// CORRECT: Uses syscall to fetch rent from runtime
+fn get_rent_correct() -> Result<Rent, ProgramError> {
+    Rent::get()
+}
+
+// INCORRECT: Returns hardcoded Solana rent values
+fn get_rent_wrong() -> Rent {
+    Rent::default() // DO NOT USE - ignores InfiniSVM's rent
+}
+```
+
+## Best Practices Summary
+
+1. **Always query rent from the chain**
+   ```typescript
+   const lamports = await connection.getMinimumBalanceForRentExemption(size);
+   ```
+
+2. **Use "V2" or "V3" instruction variants** - They use the `Rent::get()` syscall internally
+
+3. **Calculate account sizes dynamically for Token 2022** - Use `getMintLen()` and `getAccountLen()` with your extensions
+
+4. **In Rust programs, use `Rent::get()`** - Never use `Rent::default()` which returns hardcoded values
+
+## Quick Reference
+
+### Safe Instructions (use `Rent::get()` syscall)
+
+- `InitializeMint2`
+- `InitializeAccount2`
+- `InitializeAccount3`
+- `InitializeMultisig2`
+
+### Instructions to Avoid (use Rent sysvar)
+
+- `InitializeMint`
+- `InitializeAccount`
+- `InitializeMultisig`
+
+By following these guidelines, your applications will correctly use InfiniSVM's 99% cheaper rent and avoid overpaying for account creation.
